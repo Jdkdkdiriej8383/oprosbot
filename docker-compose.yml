@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  oprosbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oprosbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persistent storage for SQLite database and exported reports
+      - ./data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/oprosbot.db
+      - TIMEZONE=UTC
+      - LOG_LEVEL=INFO

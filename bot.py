@@ -1,0 +1,99 @@
+"""Main entry point for oprosbot with Telegram Forum Topics support."""
+
+import asyncio
+import logging
+import sys
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
+
+from config import get_settings
+from database.db_manager import close_db, get_session_factory, init_db
+from handlers import (
+    admin_poll_router,
+    create_poll_router,
+    inline_router,
+    start_router,
+    voting_router,
+)
+from services.scheduler import get_scheduler, resume_scheduled_polls
+from utils.logging import setup_logging
+
+logger = logging.getLogger("oprosbot")
+
+
+async def set_bot_commands(bot: Bot) -> None:
+    """Configures bot menu commands in Telegram UI."""
+    commands = [
+        BotCommand(command="create_poll", description="➕ Создать новый опрос"),
+        BotCommand(command="my_polls", description="📋 Мои опросы и управление"),
+        BotCommand(command="help", description="ℹ️ Инструкция и справка"),
+    ]
+    await bot.set_my_commands(commands)
+
+
+async def main() -> None:
+    """Main startup routine."""
+    try:
+        settings = get_settings()
+    except Exception as e:
+        print(f"CRITICAL: Failed to load configuration: {e}", file=sys.stderr)
+        print("Please ensure .env file exists and BOT_TOKEN is set.", file=sys.stderr)
+        sys.exit(1)
+
+    setup_logging(settings.LOG_LEVEL)
+    logger.info("Starting oprosbot application...")
+
+    logger.info("Connecting to database: %s", settings.DATABASE_URL)
+    await init_db(settings.DATABASE_URL)
+    session_factory = get_session_factory(settings.DATABASE_URL)
+
+    bot = Bot(
+        token=settings.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Dependency injection
+    dp["session_factory"] = session_factory
+
+    # Register routers
+    dp.include_router(start_router)
+    dp.include_router(create_poll_router)
+    dp.include_router(voting_router)
+    dp.include_router(admin_poll_router)
+    dp.include_router(inline_router)
+
+    # APScheduler
+    scheduler = get_scheduler()
+    scheduler.start()
+    logger.info("APScheduler started successfully.")
+
+    bot_info = await bot.get_me()
+    logger.info("Logged in as @%s (%s)", bot_info.username, bot_info.full_name)
+    await set_bot_commands(bot)
+
+    # Resume scheduled poll auto-closings from database
+    await resume_scheduled_polls(bot, session_factory)
+
+    try:
+        logger.info("Bot is running and polling for updates...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        logger.info("Shutting down oprosbot...")
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+        await close_db()
+        await bot.session.close()
+        logger.info("Bot shutdown completed.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user.")
