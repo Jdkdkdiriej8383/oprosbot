@@ -1,5 +1,6 @@
 """Handlers for /start, /help, /my_polls, and deep-link routing."""
 
+import html
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -138,8 +139,9 @@ async def cmd_start_default(
             full_name=message.from_user.full_name,
         )
 
+    first_name = html.escape(message.from_user.first_name or "друг")
     greeting = (
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        f"👋 <b>Привет, {first_name}!</b>\n\n"
         f"Я — бот для проведения интерактивных опросов со <b>скрытыми результатами</b>, "
         f"поддержкой <b>форумных тем (Topics / Ветки)</b> и <b>открытых развёрнутых ответов</b>.\n\n"
         f"✨ <b>Возможности:</b>\n"

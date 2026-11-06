@@ -8,7 +8,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import BotCommand
+from aiogram.types import BotCommand, Update
 
 from config import get_settings
 from database.db_manager import close_db, get_session_factory, init_db
@@ -58,6 +58,33 @@ async def main() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dp = Dispatcher(storage=MemoryStorage())
+
+    # Outer middleware for transparent update logging
+    @dp.update.outer_middleware()
+    async def log_update_middleware(handler, event: Update, data: dict):
+        if event.message:
+            msg = event.message
+            u = msg.from_user
+            u_info = f"@{u.username}" if u and u.username else f"id:{u.id if u else 'unknown'}"
+            chat_info = f"{msg.chat.type}:{msg.chat.id}"
+            if msg.message_thread_id:
+                chat_info += f" (thread {msg.message_thread_id})"
+            logger.info("📩 Message from %s in %s: %r", u_info, chat_info, msg.text or msg.caption or "<media>")
+        elif event.callback_query:
+            cb = event.callback_query
+            u = cb.from_user
+            u_info = f"@{u.username}" if u and u.username else f"id:{u.id if u else 'unknown'}"
+            logger.info("🔘 Callback from %s: data=%r", u_info, cb.data)
+        elif event.my_chat_member:
+            m = event.my_chat_member
+            logger.info(
+                "👥 Chat member status changed in '%s' (%s): %s -> %s",
+                m.chat.title,
+                m.chat.id,
+                m.old_chat_member.status,
+                m.new_chat_member.status,
+            )
+        return await handler(event, data)
 
     # Dependency injection
     dp["session_factory"] = session_factory
