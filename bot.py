@@ -21,6 +21,7 @@ from handlers import (
     voting_router,
 )
 from services.scheduler import get_scheduler, resume_scheduled_polls
+from utils.health_server import start_health_server
 from utils.logging import setup_logging
 
 logger = logging.getLogger("oprosbot")
@@ -74,6 +75,9 @@ async def main() -> None:
     scheduler.start()
     logger.info("APScheduler started successfully.")
 
+    # Start HTTP health check server if PORT is configured (Render / cloud hosting)
+    health_runner = await start_health_server(settings.PORT)
+
     bot_info = await bot.get_me()
     logger.info("Logged in as @%s (%s)", bot_info.username, bot_info.full_name)
     await set_bot_commands(bot)
@@ -88,6 +92,8 @@ async def main() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Shutting down oprosbot...")
+        if health_runner:
+            await health_runner.cleanup()
         if scheduler.running:
             scheduler.shutdown(wait=False)
         await close_db()

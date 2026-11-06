@@ -31,6 +31,10 @@ class Settings(BaseSettings):
         default="INFO",
         description="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)"
     )
+    PORT: Optional[int] = Field(
+        default=None,
+        description="Port for HTTP health check web server (Render, Railway, etc.)"
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",
