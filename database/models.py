@@ -1,4 +1,4 @@
-"""SQLAlchemy 2.0 Async database models for polls, topics, and votes."""
+"""SQLAlchemy 2.0 Async database models for polls, topics, group chats, and votes."""
 
 from datetime import datetime
 from typing import List, Optional
@@ -36,6 +36,62 @@ class User(Base):
     polls: Mapped[List["Poll"]] = relationship(
         "Poll", back_populates="creator", cascade="all, delete-orphan"
     )
+    added_chats: Mapped[List["GroupChat"]] = relationship(
+        "GroupChat", back_populates="added_by_user"
+    )
+
+
+class GroupChat(Base):
+    """Tracks groups/supergroups where the bot was added."""
+    __tablename__ = "group_chats"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)  # chat_id (e.g. -100...)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    chat_type: Mapped[str] = mapped_column(String(32), default="supergroup")
+    is_forum: Mapped[bool] = mapped_column(Boolean, default=False)
+    added_by_user_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    added_by_user: Mapped[Optional["User"]] = relationship(
+        "User", back_populates="added_chats"
+    )
+    topics: Mapped[List["ForumTopic"]] = relationship(
+        "ForumTopic",
+        back_populates="chat",
+        cascade="all, delete-orphan",
+        order_by="ForumTopic.title",
+        lazy="selectin",
+    )
+
+
+class ForumTopic(Base):
+    """Tracks forum topics (message_thread_id) in supergroups."""
+    __tablename__ = "forum_topics"
+    __table_args__ = (
+        UniqueConstraint("chat_id", "thread_id", name="uq_chat_thread"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_chats.id", ondelete="CASCADE"), index=True
+    )
+    thread_id: Mapped[int] = mapped_column(Integer, nullable=False)  # message_thread_id
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    icon_emoji: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    chat: Mapped["GroupChat"] = relationship("GroupChat", back_populates="topics")
 
 
 class Poll(Base):

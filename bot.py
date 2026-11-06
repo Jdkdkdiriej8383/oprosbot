@@ -15,6 +15,7 @@ from database.db_manager import close_db, get_session_factory, init_db
 from handlers import (
     admin_poll_router,
     create_poll_router,
+    group_events_router,
     inline_router,
     start_router,
     voting_router,
@@ -65,6 +66,7 @@ async def main() -> None:
     dp.include_router(create_poll_router)
     dp.include_router(voting_router)
     dp.include_router(admin_poll_router)
+    dp.include_router(group_events_router)
     dp.include_router(inline_router)
 
     # APScheduler
@@ -82,6 +84,7 @@ async def main() -> None:
     try:
         logger.info("Bot is running and polling for updates...")
         await bot.delete_webhook(drop_pending_updates=True)
+        # allowed_updates automatically resolves all used types including my_chat_member
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         logger.info("Shutting down oprosbot...")

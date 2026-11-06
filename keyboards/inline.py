@@ -1,8 +1,8 @@
-"""Inline keyboard builders for polls, wizard, and management."""
+"""Inline keyboard builders for polls, wizard, groups, topics, and management."""
 
-from typing import List
+from typing import List, Optional
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from database.models import Option
+from database.models import ForumTopic, GroupChat, Option
 
 
 def get_cancel_keyboard(callback_data: str = "cancel_wizard") -> InlineKeyboardMarkup:
@@ -105,7 +105,7 @@ def get_deadline_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_target_destination_keyboard() -> InlineKeyboardMarkup:
-    """Step 5: Select publishing destination (current PM or group/topic)."""
+    """Step 5: Select publishing destination fallback (current PM or group/topic)."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -129,6 +129,110 @@ def get_target_destination_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")],
         ]
     )
+
+
+def get_groups_selection_keyboard(groups: List[GroupChat]) -> InlineKeyboardMarkup:
+    """Step 5: Interactive list of registered groups + options."""
+    rows = []
+
+    # Button for each connected group
+    for g in groups:
+        forum_badge = " [Форум/Темы]" if g.is_forum else ""
+        short_title = g.title[:30] + ("..." if len(g.title) > 30 else "")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"👥 {short_title}{forum_badge}",
+                    callback_data=f"sel_grp:{g.id}",
+                )
+            ]
+        )
+
+    # Current chat (PM) option
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="💬 Опубликовать здесь (в этот диалог)",
+                callback_data="target:current",
+            )
+        ]
+    )
+
+    # Manual input or forwarding
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="➕ Указать другой чат / тему вручную",
+                callback_data="target:topic_manual",
+            )
+        ]
+    )
+
+    # Inline mode only
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📤 Только через Inline-режим (@bot)",
+                callback_data="target:inline_only",
+            )
+        ]
+    )
+
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_topics_selection_keyboard(
+    chat_id: int,
+    topics: List[ForumTopic],
+    is_forum: bool = True,
+) -> InlineKeyboardMarkup:
+    """Step 5b: List of known topics in the selected group."""
+    rows = []
+
+    # General / Main topic option
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="💬 Основная ветка (General)",
+                callback_data=f"sel_tpc:{chat_id}:0",
+            )
+        ]
+    )
+
+    # Each registered topic
+    for t in topics:
+        if t.thread_id != 0:
+            short_t = t.title[:30] + ("..." if len(t.title) > 30 else "")
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"📌 {short_t}",
+                        callback_data=f"sel_tpc:{chat_id}:{t.thread_id}",
+                    )
+                ]
+            )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="➕ Ввести ID темы вручную",
+                callback_data=f"sel_tpc_manual:{chat_id}",
+            )
+        ]
+    )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="🔙 Назад к списку групп",
+                callback_data="back_to_groups",
+            )
+        ]
+    )
+
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def get_choice_voting_keyboard(
@@ -175,28 +279,46 @@ def get_creator_manage_keyboard(
     bot_username: str,
     poll_type: str,
     is_closed: bool = False,
+    message_link: Optional[str] = None,
 ) -> InlineKeyboardMarkup:
     """Creator's management panel."""
-    rows = [
+    rows = []
+
+    # If poll was published into a chat and link is available
+    if message_link:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="🔗 Открыть опрос в чате",
+                    url=message_link,
+                )
+            ]
+        )
+
+    rows.append(
         [
             InlineKeyboardButton(
                 text="📤 Опубликовать в чат/канал",
                 switch_inline_query=f"poll_{poll_id}",
             )
-        ],
+        ]
+    )
+    rows.append(
         [
             InlineKeyboardButton(
                 text="📊 Финальные результаты" if is_closed else "📊 Текущая статистика",
                 callback_data=f"stats:{poll_id}",
             )
-        ],
+        ]
+    )
+    rows.append(
         [
             InlineKeyboardButton(
                 text="📁 Экспорт ответов (CSV / TXT)" if poll_type == "text" else "📁 Экспорт голосов (CSV)",
                 callback_data=f"export:{poll_id}",
             )
-        ],
-    ]
+        ]
+    )
 
     if not is_closed:
         rows.append(

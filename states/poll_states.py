@@ -12,6 +12,7 @@ class PollCreation(StatesGroup):
     waiting_for_custom_deadline = State()
     waiting_for_destination = State()
     waiting_for_topic_forward_or_id = State()
+    waiting_for_custom_topic_id = State()
 
 
 class TextResponseState(StatesGroup):

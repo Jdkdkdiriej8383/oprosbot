@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import selectinload
 
-from database.models import Base, Option, Poll, PollPost, TextAnswer, User, Vote
+from database.models import Base, ForumTopic, GroupChat, Option, Poll, PollPost, TextAnswer, User, Vote
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ async def close_db() -> None:
 
 
 # ==============================================================================
-# CRUD Operations
+# User CRUD
 # ==============================================================================
 
 async def upsert_user(
@@ -99,6 +99,141 @@ async def upsert_user(
     await session.refresh(user)
     return user
 
+
+# ==============================================================================
+# GroupChat and ForumTopic CRUD
+# ==============================================================================
+
+async def upsert_group_chat(
+    session: AsyncSession,
+    chat_id: int,
+    title: str,
+    username: Optional[str] = None,
+    chat_type: str = "supergroup",
+    is_forum: bool = False,
+    added_by_user_id: Optional[int] = None,
+) -> GroupChat:
+    """Creates or updates a registered group chat."""
+    stmt = select(GroupChat).where(GroupChat.id == chat_id)
+    res = await session.execute(stmt)
+    chat = res.scalar_one_or_none()
+
+    now_utc = datetime.now(timezone.utc)
+
+    if chat is None:
+        chat = GroupChat(
+            id=chat_id,
+            title=title,
+            username=username,
+            chat_type=chat_type,
+            is_forum=is_forum,
+            added_by_user_id=added_by_user_id,
+            is_active=True,
+            created_at=now_utc,
+        )
+        session.add(chat)
+    else:
+        chat.title = title
+        chat.username = username
+        chat.chat_type = chat_type
+        chat.is_forum = is_forum
+        chat.is_active = True
+        chat.updated_at = now_utc
+        if added_by_user_id is not None:
+            chat.added_by_user_id = added_by_user_id
+
+    await session.commit()
+    await session.refresh(chat)
+    return chat
+
+
+async def deactivate_group_chat(session: AsyncSession, chat_id: int) -> None:
+    """Marks group chat as inactive when bot is removed."""
+    stmt = select(GroupChat).where(GroupChat.id == chat_id)
+    res = await session.execute(stmt)
+    chat = res.scalar_one_or_none()
+    if chat:
+        chat.is_active = False
+        chat.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+
+
+async def get_group_chat(session: AsyncSession, chat_id: int) -> Optional[GroupChat]:
+    """Retrieves group chat with topics."""
+    stmt = (
+        select(GroupChat)
+        .options(selectinload(GroupChat.topics))
+        .where(GroupChat.id == chat_id)
+    )
+    res = await session.execute(stmt)
+    return res.scalar_one_or_none()
+
+
+async def get_user_group_chats(
+    session: AsyncSession,
+    user_id: int,
+) -> List[GroupChat]:
+    """Retrieves active groups that were added by this user."""
+    stmt = (
+        select(GroupChat)
+        .options(selectinload(GroupChat.topics))
+        .where(GroupChat.added_by_user_id == user_id, GroupChat.is_active == True)  # noqa: E712
+        .order_by(GroupChat.title.asc())
+    )
+    res = await session.execute(stmt)
+    return list(res.scalars().all())
+
+
+async def upsert_forum_topic(
+    session: AsyncSession,
+    chat_id: int,
+    thread_id: int,
+    title: str,
+    icon_emoji: Optional[str] = None,
+) -> ForumTopic:
+    """Registers or updates a forum topic."""
+    stmt = select(ForumTopic).where(
+        ForumTopic.chat_id == chat_id,
+        ForumTopic.thread_id == thread_id,
+    )
+    res = await session.execute(stmt)
+    topic = res.scalar_one_or_none()
+
+    if topic is None:
+        topic = ForumTopic(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            title=title,
+            icon_emoji=icon_emoji,
+        )
+        session.add(topic)
+    else:
+        topic.title = title
+        if icon_emoji:
+            topic.icon_emoji = icon_emoji
+
+    await session.commit()
+    group = await session.get(GroupChat, chat_id)
+    if group:
+        session.expire(group, ["topics"])
+    await session.refresh(topic)
+    return topic
+
+
+async def get_chat_topics(session: AsyncSession, chat_id: int) -> List[ForumTopic]:
+    """Gets all known topics for a chat."""
+    stmt = (
+        select(ForumTopic)
+        .where(ForumTopic.chat_id == chat_id)
+        .order_by(ForumTopic.title.asc())
+    )
+    res = await session.execute(stmt)
+    return list(res.scalars().all())
+
+
+# ==============================================================================
+# Poll CRUD Operations
+# ==============================================================================
 
 async def create_poll(
     session: AsyncSession,

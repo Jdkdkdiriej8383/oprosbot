@@ -1,4 +1,4 @@
-"""Comprehensive automated test suite for oprosbot with Topic and permissions support."""
+"""Comprehensive automated test suite for oprosbot with Topic, group auto-discovery and permissions."""
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,15 +15,20 @@ from database.db_manager import (
     close_poll,
     create_poll,
     get_all_text_answers,
+    get_chat_topics,
     get_choice_poll_stats,
+    get_group_chat,
     get_poll,
     get_poll_posts,
+    get_user_group_chats,
     get_user_polls,
     get_user_text_answer,
     get_user_vote,
     record_choice_vote,
     save_text_answer,
     track_poll_post,
+    upsert_forum_topic,
+    upsert_group_chat,
     upsert_user,
 )
 from keyboards.inline import (
@@ -31,11 +36,13 @@ from keyboards.inline import (
     get_close_confirmation_keyboard,
     get_creator_manage_keyboard,
     get_deadline_keyboard,
+    get_groups_selection_keyboard,
     get_options_input_keyboard,
     get_poll_type_keyboard,
     get_target_destination_keyboard,
     get_text_poll_chat_keyboard,
     get_text_response_action_keyboard,
+    get_topics_selection_keyboard,
 )
 from services.poll_service import (
     format_choice_results,
@@ -67,27 +74,47 @@ async def async_session() -> AsyncSession:
 
 
 @pytest.mark.asyncio
-async def test_user_upsert(async_session: AsyncSession):
-    """Verifies user registration and profile updates."""
+async def test_user_and_group_registration(async_session: AsyncSession):
+    """Verifies that adding bot to a group registers the group and associates with the adder."""
     user = await upsert_user(
         async_session,
         user_id=12345,
-        username="alice",
+        username="team_lead",
         full_name="Alice Smith",
     )
     assert user.id == 12345
-    assert user.username == "alice"
-    assert user.full_name == "Alice Smith"
 
-    updated = await upsert_user(
-        async_session,
-        user_id=12345,
-        username="alice_new",
-        full_name="Alice Wonderland",
+    # Register group added by user
+    group = await upsert_group_chat(
+        session=async_session,
+        chat_id=-1001234567890,
+        title="Developers Forum",
+        username="devs_forum",
+        chat_type="supergroup",
+        is_forum=True,
+        added_by_user_id=12345,
     )
-    assert updated.id == 12345
-    assert updated.username == "alice_new"
-    assert updated.full_name == "Alice Wonderland"
+    assert group.id == -1001234567890
+    assert group.is_forum is True
+    assert group.added_by_user_id == 12345
+
+    # Add topics
+    t1 = await upsert_forum_topic(async_session, chat_id=-1001234567890, thread_id=10, title="Releases")
+    t2 = await upsert_forum_topic(async_session, chat_id=-1001234567890, thread_id=25, title="Design")
+
+    # Fetch groups for user
+    user_groups = await get_user_group_chats(async_session, user_id=12345)
+    assert len(user_groups) == 1
+    assert user_groups[0].title == "Developers Forum"
+    assert len(user_groups[0].topics) == 2
+
+    # Verify keyboard generation
+    kb_groups = get_groups_selection_keyboard(user_groups)
+    assert any("Developers Forum" in btn.text for row in kb_groups.inline_keyboard for btn in row)
+
+    kb_topics = get_topics_selection_keyboard(-1001234567890, user_groups[0].topics, is_forum=True)
+    assert any("Releases" in btn.text for row in kb_topics.inline_keyboard for btn in row)
+    assert any("Design" in btn.text for row in kb_topics.inline_keyboard for btn in row)
 
 
 @pytest.mark.asyncio
@@ -95,7 +122,6 @@ async def test_choice_poll_with_topic_tracking(async_session: AsyncSession):
     """Verifies choice poll creation with target topic and vote mechanics."""
     creator = await upsert_user(async_session, user_id=100, full_name="Creator")
 
-    # Poll targeting supergroup -1001234567890 and forum topic 42
     poll = await create_poll(
         session=async_session,
         poll_id="poll_topic_1",
@@ -230,7 +256,7 @@ async def test_text_poll_workflow(async_session: AsyncSession):
     all_answers = await get_all_text_answers(async_session, "poll_text_1")
     assert len(all_answers) == 1
     assert "Updated" in all_answers[0].answer_text
-    assert all_answers[0].user_fullname == "Charlie"  # Preserved!
+    assert all_answers[0].user_fullname == "Charlie"
 
     # Test CSV export
     csv_bytes = generate_text_answers_csv(poll.question, all_answers)
@@ -264,7 +290,7 @@ async def test_admin_and_creator_permissions(async_session: AsyncSession):
     assert success is False
     assert "нет прав" in msg
 
-    # Chat admin (id=888 with is_admin=True) can close
+    # Chat Admin can close
     success, p, msg = await close_poll(async_session, "poll_perm_test", user_id=888, is_admin=True)
     assert success is True
     assert p.is_closed is True
@@ -281,7 +307,7 @@ async def test_admin_and_creator_permissions(async_session: AsyncSession):
 
 
 def test_ui_and_keyboards():
-    """Verifies keyboard builders including destination keyboard."""
+    """Verifies keyboard builders."""
     assert render_progress_bar(50, length=8) == "🟩🟩🟩🟩⬜⬜⬜⬜"
     assert pluralize_votes(1) == "голос"
     assert pluralize_votes(3) == "голоса"
@@ -291,3 +317,11 @@ def test_ui_and_keyboards():
     assert any("тему форума" in btn.text for row in kb_dest.inline_keyboard for btn in row)
     kb_type = get_poll_type_keyboard()
     assert len(kb_type.inline_keyboard) == 3
+    kb_manage = get_creator_manage_keyboard(
+        poll_id="p1",
+        bot_username="test_bot",
+        poll_type="choice",
+        is_closed=False,
+        message_link="https://t.me/c/123/45/67",
+    )
+    assert any("Открыть опрос в чате" in btn.text for row in kb_manage.inline_keyboard for btn in row)
