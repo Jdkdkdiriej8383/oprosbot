@@ -1,6 +1,7 @@
 """Database manager and CRUD operations with topic and async SQLite/PostgreSQL support."""
 
 from datetime import datetime, timezone
+import json
 import logging
 from typing import List, Optional, Tuple
 
@@ -13,7 +14,18 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import selectinload
 
-from database.models import Base, ForumTopic, GroupChat, Option, Poll, PollPost, TextAnswer, User, Vote
+from database.models import (
+    Base,
+    ForumTopic,
+    GroupChat,
+    Option,
+    Poll,
+    PollPost,
+    PollTemplate,
+    TextAnswer,
+    User,
+    Vote,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +68,39 @@ def get_session_factory(database_url: str = "sqlite+aiosqlite:///oprosbot.db") -
 
 
 async def init_db(database_url: str = "sqlite+aiosqlite:///oprosbot.db") -> None:
-    """Creates database tables."""
+    """Creates database tables and applies lightweight schema migrations."""
     engine = get_engine(database_url)
     async with engine.begin() as conn:
         logger.info("Initializing database schema...")
         await conn.run_sync(Base.metadata.create_all)
+
+        # SQLite automatic migration check for new columns
+        if "sqlite" in database_url:
+            from sqlalchemy import text
+            try:
+                res = await conn.execute(text("PRAGMA table_info(polls)"))
+                cols = {row[1] for row in res.fetchall()}
+                if "result_chat_id" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN result_chat_id BIGINT"))
+                    logger.info("Schema migration: added polls.result_chat_id")
+                if "result_thread_id" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN result_thread_id INTEGER"))
+                    logger.info("Schema migration: added polls.result_thread_id")
+                if "is_multiple_choice" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN is_multiple_choice BOOLEAN DEFAULT 0"))
+                    logger.info("Schema migration: added polls.is_multiple_choice")
+                if "is_anonymous" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN is_anonymous BOOLEAN DEFAULT 1"))
+                    logger.info("Schema migration: added polls.is_anonymous")
+                if "reminder_minutes" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN reminder_minutes INTEGER"))
+                    logger.info("Schema migration: added polls.reminder_minutes")
+                if "allowed_voters" not in cols:
+                    await conn.execute(text("ALTER TABLE polls ADD COLUMN allowed_voters VARCHAR(50) DEFAULT 'all'"))
+                    logger.info("Schema migration: added polls.allowed_voters")
+            except Exception as e:
+                logger.warning("Could not verify schema columns: %s", e)
+
         logger.info("Database schema initialized.")
 
 
@@ -247,8 +287,14 @@ async def create_poll(
     results_visibility: str = "hidden_until_close",
     target_chat_id: Optional[int] = None,
     target_thread_id: Optional[int] = None,
+    result_chat_id: Optional[int] = None,
+    result_thread_id: Optional[int] = None,
+    is_multiple_choice: bool = False,
+    is_anonymous: bool = True,
+    reminder_minutes: Optional[int] = None,
+    allowed_voters: str = "all",
 ) -> Poll:
-    """Creates a new poll with topic support."""
+    """Creates a new poll with topic, custom result destination, and advanced options."""
     poll = Poll(
         id=poll_id,
         creator_id=creator_id,
@@ -259,6 +305,12 @@ async def create_poll(
         results_visibility=results_visibility,
         target_chat_id=target_chat_id,
         target_thread_id=target_thread_id,
+        result_chat_id=result_chat_id,
+        result_thread_id=result_thread_id,
+        is_multiple_choice=is_multiple_choice,
+        is_anonymous=is_anonymous,
+        reminder_minutes=reminder_minutes,
+        allowed_voters=allowed_voters,
         is_closed=False,
     )
     session.add(poll)
@@ -294,7 +346,7 @@ async def get_poll(session: AsyncSession, poll_id: str) -> Optional[Poll]:
 async def get_user_polls(
     session: AsyncSession,
     creator_id: int,
-    limit: int = 15,
+    limit: int = 25,
 ) -> List[Poll]:
     """Retrieves polls created by a user."""
     stmt = (
@@ -308,6 +360,91 @@ async def get_user_polls(
     return list(res.scalars().all())
 
 
+async def update_poll_question(
+    session: AsyncSession,
+    poll_id: str,
+    question: str,
+) -> Optional[Poll]:
+    """Updates question text of an active poll."""
+    stmt = update(Poll).where(Poll.id == poll_id).values(question=question)
+    await session.execute(stmt)
+    await session.commit()
+    return await get_poll(session, poll_id)
+
+
+async def add_poll_option(
+    session: AsyncSession,
+    poll_id: str,
+    option_text: str,
+) -> Optional[Option]:
+    """Adds a new option to a choice poll while it is running."""
+    poll = await get_poll(session, poll_id)
+    if not poll or poll.is_closed or poll.poll_type != "choice":
+        return None
+    next_idx = len(poll.options)
+    opt = Option(
+        poll_id=poll_id,
+        text=option_text.strip(),
+        order_index=next_idx,
+    )
+    session.add(opt)
+    await session.commit()
+    session.expire(poll, ["options"])
+    await session.refresh(opt)
+    return opt
+
+
+async def update_poll_deadline(
+    session: AsyncSession,
+    poll_id: str,
+    deadline_at: Optional[datetime],
+) -> Optional[Poll]:
+    """Updates deadline of an active poll."""
+    stmt = update(Poll).where(Poll.id == poll_id).values(deadline_at=deadline_at)
+    await session.execute(stmt)
+    await session.commit()
+    return await get_poll(session, poll_id)
+
+
+async def update_poll_result_destination(
+    session: AsyncSession,
+    poll_id: str,
+    result_chat_id: Optional[int],
+    result_thread_id: Optional[int],
+) -> Optional[Poll]:
+    """Updates where the results will be published."""
+    stmt = update(Poll).where(Poll.id == poll_id).values(
+        result_chat_id=result_chat_id,
+        result_thread_id=result_thread_id,
+    )
+    await session.execute(stmt)
+    await session.commit()
+    return await get_poll(session, poll_id)
+
+
+async def delete_poll(session: AsyncSession, poll_id: str) -> bool:
+    """Deletes a poll and cascades all associated votes, answers, and posts."""
+    poll = await get_poll(session, poll_id)
+    if not poll:
+        return False
+    await session.delete(poll)
+    await session.commit()
+    return True
+
+
+async def delete_closed_polls_for_user(session: AsyncSession, creator_id: int) -> int:
+    """Deletes all finished/closed polls for a given creator."""
+    stmt = select(Poll.id).where(Poll.creator_id == creator_id, Poll.is_closed == True)  # noqa: E712
+    res = await session.execute(stmt)
+    poll_ids = list(res.scalars().all())
+    if not poll_ids:
+        return 0
+    del_stmt = delete(Poll).where(Poll.id.in_(poll_ids))
+    await session.execute(del_stmt)
+    await session.commit()
+    return len(poll_ids)
+
+
 async def record_choice_vote(
     session: AsyncSession,
     poll_id: str,
@@ -315,9 +452,10 @@ async def record_choice_vote(
     option_id: int,
     user_fullname: Optional[str] = None,
     username: Optional[str] = None,
+    is_admin: bool = False,
 ) -> Tuple[bool, bool, str]:
     """
-    Records or updates a choice vote.
+    Records or updates a choice vote with multiple-choice and voter restriction support.
     Returns: (success, is_changed, notification_message)
     """
     poll = await get_poll(session, poll_id)
@@ -326,6 +464,12 @@ async def record_choice_vote(
 
     if poll.is_closed:
         return False, False, "🔒 Опрос уже завершён. Приём голосов закрыт."
+
+    if poll.allowed_voters == "with_username" and not username:
+        return False, False, "⛔ В этом опросе могут голосовать только участники с установленным @username в профиле Telegram."
+
+    if poll.allowed_voters == "admins_only" and not is_admin and user_id != poll.creator_id:
+        return False, False, "⛔ В этом опросе могут голосовать только администраторы."
 
     opt_stmt = select(Option).where(
         Option.id == option_id,
@@ -336,14 +480,41 @@ async def record_choice_vote(
     if not option:
         return False, False, "❌ Выбранный вариант не найден."
 
+    now_utc = datetime.now(timezone.utc)
+
+    if poll.is_multiple_choice:
+        # Multiple choice toggle: check if user already voted for this option
+        specific_vote_stmt = select(Vote).where(
+            Vote.poll_id == poll_id,
+            Vote.user_id == user_id,
+            Vote.option_id == option_id,
+        )
+        res = await session.execute(specific_vote_stmt)
+        this_vote = res.scalar_one_or_none()
+        if this_vote:
+            await session.delete(this_vote)
+            await session.commit()
+            return True, True, f"Вы сняли выбор с варианта «{option.text}». 👌"
+        else:
+            new_vote = Vote(
+                poll_id=poll_id,
+                user_id=user_id,
+                option_id=option_id,
+                user_fullname=user_fullname,
+                username=username,
+                voted_at=now_utc,
+            )
+            session.add(new_vote)
+            await session.commit()
+            return True, True, f"Вы выбрали «{option.text}»! ✅\n(Множественный выбор: можете выбрать ещё)"
+
+    # Single choice
     vote_stmt = select(Vote).where(
         Vote.poll_id == poll_id,
         Vote.user_id == user_id,
     )
     vote_res = await session.execute(vote_stmt)
     existing_vote = vote_res.scalar_one_or_none()
-
-    now_utc = datetime.now(timezone.utc)
 
     if existing_vote:
         if existing_vote.option_id == option_id:
@@ -386,7 +557,11 @@ async def get_user_vote(
     return res.scalar_one_or_none()
 
 
-async def get_choice_poll_stats(session: AsyncSession, poll_id: str) -> dict:
+async def get_choice_poll_stats(
+    session: AsyncSession,
+    poll_id: str,
+    include_voters: bool = False,
+) -> dict:
     """Calculates statistics for a choice poll."""
     options_stmt = (
         select(Option)
@@ -406,18 +581,27 @@ async def get_choice_poll_stats(session: AsyncSession, poll_id: str) -> dict:
 
     total_votes = sum(counts_map.values())
 
+    opt_voters = {}
+    if include_voters:
+        v_stmt = select(Vote).where(Vote.poll_id == poll_id).order_by(Vote.voted_at.asc())
+        v_res = await session.execute(v_stmt)
+        for v in v_res.scalars().all():
+            v_name = f"@{v.username}" if v.username else (v.user_fullname or f"ID:{v.user_id}")
+            opt_voters.setdefault(v.option_id, []).append(v_name)
+
     results = []
     for opt in options:
         count = counts_map.get(opt.id, 0)
         percentage = (count / total_votes * 100) if total_votes > 0 else 0.0
-        results.append(
-            {
-                "option_id": opt.id,
-                "text": opt.text,
-                "count": count,
-                "percentage": round(percentage, 1),
-            }
-        )
+        opt_data = {
+            "option_id": opt.id,
+            "text": opt.text,
+            "count": count,
+            "percentage": round(percentage, 1),
+        }
+        if include_voters:
+            opt_data["voters"] = opt_voters.get(opt.id, [])
+        results.append(opt_data)
 
     return {
         "poll_id": poll_id,
@@ -433,6 +617,7 @@ async def save_text_answer(
     text: str,
     user_fullname: Optional[str] = None,
     username: Optional[str] = None,
+    is_admin: bool = False,
 ) -> Tuple[bool, bool, str]:
     """Saves or updates an open text answer."""
     poll = await get_poll(session, poll_id)
@@ -441,6 +626,12 @@ async def save_text_answer(
 
     if poll.is_closed:
         return False, False, "🔒 Опрос уже завершён. Приём ответов закрыт."
+
+    if poll.allowed_voters == "with_username" and not username:
+        return False, False, "⛔ В этом опросе могут участвовать только пользователи с установленным @username в профиле Telegram."
+
+    if poll.allowed_voters == "admins_only" and not is_admin and user_id != poll.creator_id:
+        return False, False, "⛔ В этом опросе могут участвовать только администраторы."
 
     now_utc = datetime.now(timezone.utc)
 
@@ -588,3 +779,77 @@ async def get_active_polls_with_deadlines(
     )
     res = await session.execute(stmt)
     return list(res.scalars().all())
+
+
+# ==============================================================================
+# Poll Templates CRUD
+# ==============================================================================
+
+async def create_poll_template(
+    session: AsyncSession,
+    user_id: int,
+    title: str,
+    poll_type: str,
+    question: str,
+    options: Optional[List[str]] = None,
+    is_multiple_choice: bool = False,
+    is_anonymous: bool = True,
+    allowed_voters: str = "all",
+) -> PollTemplate:
+    """Creates a reusable poll template."""
+    opts_json = json.dumps(options, ensure_ascii=False) if options else None
+    tpl = PollTemplate(
+        user_id=user_id,
+        title=title.strip(),
+        poll_type=poll_type,
+        question=question.strip(),
+        options_json=opts_json,
+        is_multiple_choice=is_multiple_choice,
+        is_anonymous=is_anonymous,
+        allowed_voters=allowed_voters,
+    )
+    session.add(tpl)
+    await session.commit()
+    await session.refresh(tpl)
+    return tpl
+
+
+async def get_user_templates(
+    session: AsyncSession,
+    user_id: int,
+) -> List[PollTemplate]:
+    """Retrieves all templates created by a user."""
+    stmt = (
+        select(PollTemplate)
+        .where(PollTemplate.user_id == user_id)
+        .order_by(PollTemplate.created_at.desc())
+    )
+    res = await session.execute(stmt)
+    return list(res.scalars().all())
+
+
+async def get_template(
+    session: AsyncSession,
+    template_id: int,
+) -> Optional[PollTemplate]:
+    """Retrieves a single template by ID."""
+    return await session.get(PollTemplate, template_id)
+
+
+async def delete_template(
+    session: AsyncSession,
+    template_id: int,
+    user_id: int,
+) -> bool:
+    """Deletes a template if owned by user."""
+    stmt = select(PollTemplate).where(
+        PollTemplate.id == template_id,
+        PollTemplate.user_id == user_id,
+    )
+    res = await session.execute(stmt)
+    tpl = res.scalar_one_or_none()
+    if not tpl:
+        return False
+    await session.delete(tpl)
+    await session.commit()
+    return True

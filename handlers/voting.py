@@ -74,6 +74,16 @@ async def process_choice_vote(
             inline_message_id=inline_message_id,
         )
 
+        # Determine if user is admin in current chat (for admins_only polls)
+        is_admin = False
+        if chat_id and callback.message and callback.message.chat.type in ("group", "supergroup"):
+            try:
+                member = await callback.bot.get_chat_member(chat_id=chat_id, user_id=user.id)
+                if member.status in ("creator", "administrator"):
+                    is_admin = True
+            except Exception:
+                pass
+
         success, is_changed, alert_message = await record_choice_vote(
             session=session,
             poll_id=poll_id,
@@ -81,6 +91,7 @@ async def process_choice_vote(
             option_id=option_id,
             user_fullname=user.full_name,
             username=user.username,
+            is_admin=is_admin,
         )
 
     await callback.answer(alert_message, show_alert=True)
@@ -163,6 +174,21 @@ async def process_submitted_text_answer(
         return
 
     async with session_factory() as session:
+        poll = await get_poll(session, poll_id)
+        if not poll or poll.is_closed:
+            await state.clear()
+            await message.answer("🔒 Этот опрос уже завершён или был удалён.")
+            return
+
+        is_admin = False
+        if poll.target_chat_id:
+            try:
+                member = await message.bot.get_chat_member(chat_id=poll.target_chat_id, user_id=user.id)
+                if member.status in ("creator", "administrator"):
+                    is_admin = True
+            except Exception:
+                pass
+
         await upsert_user(
             session=session,
             user_id=user.id,
@@ -177,6 +203,7 @@ async def process_submitted_text_answer(
             text=answer_text,
             user_fullname=user.full_name,
             username=user.username,
+            is_admin=is_admin,
         )
 
     await state.clear()

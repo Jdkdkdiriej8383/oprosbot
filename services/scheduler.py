@@ -1,7 +1,7 @@
 """APScheduler service for automated poll completion with Telegram Topic support."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 from typing import Optional
 
@@ -44,8 +44,9 @@ def schedule_poll_closing(
     deadline_at: datetime,
     bot: Bot,
     session_factory: async_sessionmaker[AsyncSession],
+    reminder_minutes: Optional[int] = None,
 ) -> None:
-    """Schedules automatic poll closure at deadline."""
+    """Schedules automatic poll closure at deadline and pre-close reminder if requested."""
     scheduler = get_scheduler()
     job_id = f"close_poll_{poll_id}"
 
@@ -62,14 +63,86 @@ def schedule_poll_closing(
     )
     logger.info("Scheduled auto-closing for poll %s at %s UTC", poll_id, deadline_at)
 
+    # Schedule pre-closing reminder
+    reminder_job_id = f"reminder_{poll_id}"
+    if scheduler.get_job(reminder_job_id):
+        scheduler.remove_job(reminder_job_id)
+
+    if reminder_minutes and reminder_minutes > 0:
+        reminder_at = deadline_at - timedelta(minutes=reminder_minutes)
+        now_utc = datetime.now(timezone.utc)
+        if reminder_at.tzinfo is None:
+            reminder_at = reminder_at.replace(tzinfo=timezone.utc)
+
+        if reminder_at > now_utc:
+            scheduler.add_job(
+                send_poll_reminder,
+                trigger="date",
+                run_date=reminder_at,
+                args=[poll_id, bot, session_factory],
+                id=reminder_job_id,
+                replace_existing=True,
+            )
+            logger.info("Scheduled reminder for poll %s at %s UTC", poll_id, reminder_at)
+
 
 def cancel_poll_closing(poll_id: str) -> None:
-    """Cancels scheduled job."""
+    """Cancels scheduled closing and reminder jobs."""
     scheduler = get_scheduler()
     job_id = f"close_poll_{poll_id}"
     if scheduler.get_job(job_id):
         scheduler.remove_job(job_id)
         logger.info("Cancelled schedule for poll %s", poll_id)
+
+    reminder_job_id = f"reminder_{poll_id}"
+    if scheduler.get_job(reminder_job_id):
+        scheduler.remove_job(reminder_job_id)
+
+
+async def send_poll_reminder(
+    poll_id: str,
+    bot: Bot,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Sends pre-close notification to poll topic/chat and creator."""
+    logger.info("Executing pre-close reminder for poll %s", poll_id)
+    async with session_factory() as session:
+        poll = await get_poll(session, poll_id)
+        if not poll or poll.is_closed:
+            return
+
+        posts = await get_poll_posts(session, poll_id)
+
+    rem_min = poll.reminder_minutes or 60
+    rem_text = (
+        f"⏰ <b>Внимание: скоро завершение опроса!</b>\n\n"
+        f"❓ <b>Вопрос:</b> «{poll.question}»\n"
+        f"⏳ До окончания голосования осталось <b>~{rem_min} мин.</b>\n"
+        f"Не забудьте оставить свой голос выше! 👆"
+    )
+
+    sent_topics = set()
+    for post in posts:
+        if post.chat_id and (post.chat_id, post.message_thread_id) not in sent_topics:
+            try:
+                await bot.send_message(
+                    chat_id=post.chat_id,
+                    message_thread_id=post.message_thread_id,
+                    text=rem_text,
+                    parse_mode="HTML",
+                )
+                sent_topics.add((post.chat_id, post.message_thread_id))
+            except Exception as e:
+                logger.debug("Failed to send reminder to chat %s: %s", post.chat_id, e)
+
+    try:
+        await bot.send_message(
+            chat_id=poll.creator_id,
+            text=f"⏰ <b>Напоминание:</b> до завершения вашего опроса «{poll.question}» осталось ~{rem_min} мин.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
 
 
 async def close_poll_and_publish(
@@ -102,12 +175,14 @@ async def close_poll_and_publish(
             return False
 
         if poll.poll_type == "choice":
-            stats = await get_choice_poll_stats(session, poll_id)
+            stats = await get_choice_poll_stats(session, poll_id, include_voters=not poll.is_anonymous)
             final_text = format_choice_results(
                 question=poll.question,
                 stats=stats,
                 is_closed=True,
                 closed_at=poll.closed_at,
+                is_anonymous=poll.is_anonymous,
+                is_multiple_choice=poll.is_multiple_choice,
             )
             closed_button_text = "🔒 Голосование завершено"
         else:
@@ -134,6 +209,9 @@ async def close_poll_and_publish(
         posts = await get_poll_posts(session, poll_id)
 
     # 1. Update existing messages and publish final post to topic/chat
+    has_custom_result_dest = bool(poll.result_chat_id)
+    results_sent_chats = set()
+
     for post in posts:
         try:
             if post.inline_message_id:
@@ -155,17 +233,42 @@ async def close_poll_and_publish(
                 except TelegramAPIError as e:
                     logger.debug("Could not update reply markup: %s", e)
 
-                # Send final results post into the exact topic (message_thread_id)
-                await bot.send_message(
-                    chat_id=post.chat_id,
-                    message_thread_id=post.message_thread_id,
-                    text=final_text,
-                    parse_mode="HTML",
-                )
+                # If no custom result destination, post results into the same topic
+                if not has_custom_result_dest:
+                    await bot.send_message(
+                        chat_id=post.chat_id,
+                        message_thread_id=post.message_thread_id,
+                        text=final_text,
+                        parse_mode="HTML",
+                    )
+                    results_sent_chats.add((post.chat_id, post.message_thread_id))
+                else:
+                    try:
+                        await bot.send_message(
+                            chat_id=post.chat_id,
+                            message_thread_id=post.message_thread_id,
+                            text="🔒 <b>Опрос завершён!</b>\nИтоговые результаты опубликованы в назначенной теме и отправлены автору.",
+                            parse_mode="HTML",
+                        )
+                    except Exception:
+                        pass
         except TelegramAPIError as e:
             logger.debug("Error updating post in chat %s, thread %s: %s", post.chat_id, post.message_thread_id, e)
         except Exception as e:
             logger.error("Unexpected error publishing to post: %s", e)
+
+    # Publish to custom destination if configured
+    if has_custom_result_dest and (poll.result_chat_id, poll.result_thread_id) not in results_sent_chats:
+        try:
+            await bot.send_message(
+                chat_id=poll.result_chat_id,
+                message_thread_id=poll.result_thread_id,
+                text=final_text,
+                parse_mode="HTML",
+            )
+            logger.info("Published poll %s results to custom destination chat %s thread %s", poll_id, poll.result_chat_id, poll.result_thread_id)
+        except Exception as e:
+            logger.error("Failed to publish results to custom destination chat %s thread %s: %s", poll.result_chat_id, poll.result_thread_id, e)
 
     # 2. Notify creator in PM
     try:
@@ -186,8 +289,8 @@ async def close_poll_and_publish(
             async with session_factory() as session:
                 answers = await get_all_text_answers(session, poll_id)
 
-            csv_data = generate_text_answers_csv(poll.question, answers)
-            txt_data = generate_text_answers_txt(poll.question, answers)
+            csv_data = generate_text_answers_csv(poll.question, answers, is_anonymous=poll.is_anonymous)
+            txt_data = generate_text_answers_txt(poll.question, answers, is_anonymous=poll.is_anonymous)
 
             csv_file = BufferedInputFile(csv_data, filename=f"poll_{poll_id[:8]}_answers.csv")
             txt_file = BufferedInputFile(txt_data, filename=f"poll_{poll_id[:8]}_answers.txt")
@@ -266,4 +369,5 @@ async def resume_scheduled_polls(
                 deadline_at=deadline,
                 bot=bot,
                 session_factory=session_factory,
+                reminder_minutes=poll.reminder_minutes,
             )

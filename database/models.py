@@ -109,6 +109,14 @@ class Poll(Base):
     # Forum topic and chat routing
     target_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     target_thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)  # message_thread_id
+    result_chat_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    result_thread_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Advanced poll features
+    is_multiple_choice: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_anonymous: Mapped[bool] = mapped_column(Boolean, default=True)
+    reminder_minutes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    allowed_voters: Mapped[str] = mapped_column(String(50), default="all")
 
     is_closed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     results_visibility: Mapped[str] = mapped_column(
@@ -164,7 +172,7 @@ class Vote(Base):
     """Recorded choice vote by a user."""
     __tablename__ = "votes"
     __table_args__ = (
-        UniqueConstraint("poll_id", "user_id", name="uq_poll_user_vote"),
+        UniqueConstraint("poll_id", "user_id", "option_id", name="uq_poll_user_opt_vote"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -233,6 +241,37 @@ class PollPost(Base):
     )
 
     poll: Mapped["Poll"] = relationship("Poll", back_populates="posts")
+
+
+class PollTemplate(Base):
+    """Reusable template for recurring polls."""
+    __tablename__ = "poll_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    poll_type: Mapped[str] = mapped_column(String(20), default="choice")
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    options_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_multiple_choice: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_anonymous: Mapped[bool] = mapped_column(Boolean, default=True)
+    allowed_voters: Mapped[str] = mapped_column(String(50), default="all")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+    @property
+    def options(self) -> List[str]:
+        """Parsed list of options from JSON."""
+        if not self.options_json:
+            return []
+        try:
+            import json
+            return json.loads(self.options_json)
+        except Exception:
+            return []
 
 
 # Backwards compatibility aliases

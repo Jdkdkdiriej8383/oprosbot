@@ -37,6 +37,7 @@ from keyboards.inline import (
     get_deadline_keyboard,
     get_groups_selection_keyboard,
     get_options_input_keyboard,
+    get_poll_settings_keyboard,
     get_poll_type_keyboard,
     get_target_destination_keyboard,
     get_text_poll_chat_keyboard,
@@ -281,6 +282,25 @@ async def process_deadline_choice(
         await callback.answer()
         return
 
+    if choice == "exact":
+        await state.set_state(PollCreation.waiting_for_exact_datetime)
+        from config import get_settings
+        settings = get_settings()
+        await callback.message.edit_text(  # type: ignore
+            f"📅 <b>Укажите точную дату и время завершения:</b>\n\n"
+            f"Примеры форматов:\n"
+            f"• <code>08.11 18:00</code> (день.месяц часы:минуты)\n"
+            f"• <code>08.11.2026 18:00</code> (полная дата)\n"
+            f"• <code>21:30</code> (сегодня или завтра)\n"
+            f"• <code>завтра 15:00</code>\n\n"
+            f"<i>Часовой пояс: {settings.TIMEZONE}</i>\n\n"
+            f"<i>Отправьте сообщение с датой и временем:</i>",
+            reply_markup=get_cancel_keyboard(),
+            parse_mode="HTML",
+        )
+        await callback.answer()
+        return
+
     duration_minutes: Optional[int] = None
     if choice == "15m":
         duration_minutes = 15
@@ -296,7 +316,7 @@ async def process_deadline_choice(
         duration_minutes = None
 
     await state.update_data(duration_minutes=duration_minutes)
-    await proceed_to_destination_step(callback, state, session_factory)
+    await show_poll_settings_step(callback, state)
     await callback.answer()
 
 
@@ -332,7 +352,145 @@ async def process_custom_deadline(
         return
 
     await state.update_data(duration_minutes=duration_minutes)
-    await proceed_to_destination_step(message, state, session_factory)
+    await show_poll_settings_step(message, state)
+
+
+@router.message(PollCreation.waiting_for_exact_datetime, F.text)
+async def process_exact_datetime_step(
+    message: Message,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Parses exact deadline date and time."""
+    from config import get_settings
+    from utils.datetime_parser import parse_exact_datetime
+
+    settings = get_settings()
+    target_utc, formatted_str = parse_exact_datetime(
+        text=message.text or "",
+        tz_name=settings.TIMEZONE,
+    )
+    if not target_utc:
+        await message.answer(formatted_str or "Некорректная дата/время.", parse_mode="HTML")
+        return
+
+    await state.update_data(
+        exact_deadline_iso=target_utc.isoformat(),
+        exact_deadline_str=formatted_str,
+        duration_minutes=None,
+    )
+    await show_poll_settings_step(message, state)
+
+
+# --- Step 5: Advanced Poll Settings ---
+async def show_poll_settings_step(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+) -> None:
+    """Renders step with interactive toggles for advanced settings."""
+    data = await state.get_data()
+    poll_type = data.get("poll_type", "choice")
+    is_choice = (poll_type == "choice")
+    is_multiple = data.get("is_multiple_choice", False)
+    is_anon = data.get("is_anonymous", True)
+    voters = data.get("allowed_voters", "all")
+    has_deadline = bool(data.get("duration_minutes") or data.get("exact_deadline_iso"))
+    reminder_min = data.get("reminder_minutes")
+
+    if has_deadline and "reminder_minutes" not in data:
+        reminder_min = 60 if (data.get("duration_minutes") or 120) >= 120 else None
+        await state.update_data(reminder_minutes=reminder_min)
+
+    await state.set_state(PollCreation.waiting_for_settings)
+
+    mult_desc = "несколько вариантов" if is_multiple else "один вариант"
+    anon_desc = "анонимно" if is_anon else "открыто (имена видны)"
+    voter_desc = {
+        "all": "все участники",
+        "with_username": "только с @username",
+        "admins_only": "только админы",
+    }.get(voters, "все")
+
+    lines = [
+        "⚙️ <b>Шаг 5: Дополнительные настройки опроса</b>\n",
+        f"• <b>Выбор ответов:</b> {mult_desc}",
+        f"• <b>Приватность:</b> {anon_desc}",
+        f"• <b>Участники:</b> {voter_desc}",
+    ]
+    if has_deadline:
+        rem_str = f"за {reminder_min} мин. до дедлайна" if reminder_min else "отключено"
+        lines.append(f"• <b>Напоминание в чат:</b> {rem_str}")
+
+    lines.append("\n<i>Нажимайте кнопки ниже для переключения параметров:</i>")
+    text = "\n".join(lines)
+
+    kb = get_poll_settings_keyboard(
+        is_choice=is_choice,
+        is_multiple=is_multiple,
+        is_anon=is_anon,
+        voters=voters,
+        reminder_min=reminder_min,
+        has_deadline=has_deadline,
+    )
+
+    if isinstance(event, CallbackQuery) and event.message:
+        await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        target = event if isinstance(event, Message) else getattr(event, "message", None)
+        if target:
+            await target.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+@router.callback_query(PollCreation.waiting_for_settings, F.data == "cfg:multichoice")
+async def on_toggle_multichoice(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    curr = data.get("is_multiple_choice", False)
+    await state.update_data(is_multiple_choice=not curr)
+    await show_poll_settings_step(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(PollCreation.waiting_for_settings, F.data == "cfg:anon")
+async def on_toggle_anon(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    curr = data.get("is_anonymous", True)
+    await state.update_data(is_anonymous=not curr)
+    await show_poll_settings_step(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(PollCreation.waiting_for_settings, F.data == "cfg:voters")
+async def on_toggle_voters(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    curr = data.get("allowed_voters", "all")
+    cycle = ["all", "with_username", "admins_only"]
+    idx = cycle.index(curr) if curr in cycle else 0
+    next_val = cycle[(idx + 1) % len(cycle)]
+    await state.update_data(allowed_voters=next_val)
+    await show_poll_settings_step(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(PollCreation.waiting_for_settings, F.data == "cfg:reminder")
+async def on_toggle_reminder(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    curr = data.get("reminder_minutes")
+    cycle = [60, 30, 15, None]
+    idx = cycle.index(curr) if curr in cycle else len(cycle) - 1
+    next_val = cycle[(idx + 1) % len(cycle)]
+    await state.update_data(reminder_minutes=next_val)
+    await show_poll_settings_step(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(PollCreation.waiting_for_settings, F.data == "cfg:done")
+async def on_settings_done(
+    callback: CallbackQuery,
+    state: FSMContext,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await proceed_to_destination_step(callback, state, session_factory)
+    await callback.answer()
 
 
 # --- Step 5: Destination (Groups & Topics) Selection ---
@@ -606,11 +764,24 @@ async def finalize_and_publish_poll(
     question = data.get("question", "")
     options = data.get("options", [])
     duration_minutes = data.get("duration_minutes")
+    exact_deadline_iso = data.get("exact_deadline_iso")
+    exact_deadline_str = data.get("exact_deadline_str")
     target_chat_id = data.get("target_chat_id")
     target_thread_id = data.get("target_thread_id")
+    result_chat_id = data.get("result_chat_id")
+    result_thread_id = data.get("result_thread_id")
+    is_multiple_choice = data.get("is_multiple_choice", False)
+    is_anonymous = data.get("is_anonymous", True)
+    allowed_voters = data.get("allowed_voters", "all")
+    reminder_minutes = data.get("reminder_minutes")
 
     deadline_at: Optional[datetime] = None
-    if duration_minutes:
+    if exact_deadline_iso:
+        try:
+            deadline_at = datetime.fromisoformat(exact_deadline_iso)
+        except Exception:
+            deadline_at = None
+    elif duration_minutes:
         deadline_at = datetime.now(timezone.utc) + timedelta(minutes=duration_minutes)
 
     # Save to database
@@ -627,6 +798,12 @@ async def finalize_and_publish_poll(
             results_visibility="hidden_until_close",
             target_chat_id=target_chat_id,
             target_thread_id=target_thread_id,
+            result_chat_id=result_chat_id,
+            result_thread_id=result_thread_id,
+            is_multiple_choice=is_multiple_choice,
+            is_anonymous=is_anonymous,
+            allowed_voters=allowed_voters,
+            reminder_minutes=reminder_minutes,
         )
 
     # Schedule APScheduler job
@@ -636,16 +813,29 @@ async def finalize_and_publish_poll(
             deadline_at=deadline_at,
             bot=bot,
             session_factory=session_factory,
+            reminder_minutes=reminder_minutes,
         )
 
     bot_user = await bot.get_me()
     bot_username = bot_user.username or ""
 
-    deadline_text = (
-        f"⏱ <b>Дедлайн:</b> через {duration_minutes} мин. ({deadline_at.strftime('%d.%m.%Y %H:%M UTC')})"
-        if deadline_at
-        else "♾ <b>Дедлайн:</b> только ручное завершение"
-    )
+    if exact_deadline_str:
+        deadline_text = f"📅 <b>Дедлайн:</b> {exact_deadline_str}"
+    elif deadline_at and duration_minutes:
+        deadline_text = f"⏱ <b>Дедлайн:</b> через {duration_minutes} мин. ({deadline_at.strftime('%d.%m.%Y %H:%M UTC')})"
+    else:
+        deadline_text = "♾ <b>Дедлайн:</b> только ручное завершение"
+
+    badges = []
+    if poll_type == "choice":
+        badges.append("☑️ Несколько ответов" if is_multiple_choice else "🔘 Один ответ")
+    badges.append("🔒 Анонимный" if is_anonymous else "👤 Открытый")
+    if allowed_voters == "with_username":
+        badges.append("🛡 Только с @username")
+    elif allowed_voters == "admins_only":
+        badges.append("👑 Только админы")
+
+    mode_badge = f"<i>ℹ️ {', '.join(badges)}</i>\n"
 
     published_in_target = False
     message_link: Optional[str] = None
@@ -658,6 +848,7 @@ async def finalize_and_publish_poll(
                 post_text = (
                     f"📊 <b>Опрос:</b>\n"
                     f"«{question}»\n\n"
+                    f"{mode_badge}"
                     f"<i>🔒 Результаты скрыты до завершения голосования.</i>\n"
                     f"{deadline_text}"
                 )
@@ -666,6 +857,7 @@ async def finalize_and_publish_poll(
                 post_text = (
                     f"📝 <b>Опрос с открытым ответом:</b>\n"
                     f"«{question}»\n\n"
+                    f"{mode_badge}"
                     f"<i>Нажмите кнопку ниже, чтобы дать развёрнутый ответ боту в ЛС.</i>\n"
                     f"{deadline_text}"
                 )

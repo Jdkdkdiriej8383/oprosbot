@@ -48,13 +48,25 @@ def format_choice_results(
     is_closed: bool = True,
     closed_at: datetime | None = None,
     deadline_at: datetime | None = None,
+    is_anonymous: bool = True,
+    is_multiple_choice: bool = False,
 ) -> str:
     """Formats final or intermediate results for choice polls."""
     status_emoji = "🏁" if is_closed else "📊"
     status_header = "Результаты опроса (Опрос завершён)" if is_closed else "Текущие результаты опроса"
 
+    badges = []
+    if is_multiple_choice:
+        badges.append("☑️ Несколько ответов")
+    if not is_anonymous:
+        badges.append("👤 Открытый")
+    else:
+        badges.append("🔒 Анонимный")
+
+    badges_str = f" <i>({', '.join(badges)})</i>" if badges else ""
+
     lines = [
-        f"{status_emoji} <b>{status_header}</b>\n",
+        f"{status_emoji} <b>{status_header}</b>{badges_str}\n",
         f"❓ <b>Вопрос:</b>\n«{question}»\n",
         "────────────────────",
     ]
@@ -74,8 +86,15 @@ def format_choice_results(
 
             lines.append(
                 f"<b>{text}</b>\n"
-                f"{bar} <b>{pct:.1f}%</b> ({count} {vote_word})\n"
+                f"{bar} <b>{pct:.1f}%</b> ({count} {vote_word})"
             )
+            voters = opt.get("voters", [])
+            if not is_anonymous and voters:
+                voters_str = ", ".join(voters[:15])
+                if len(voters) > 15:
+                    voters_str += f" и ещё {len(voters) - 15}"
+                lines.append(f"   👥 <i>{voters_str}</i>")
+            lines.append("")
 
     lines.append("────────────────────")
     lines.append(f"👥 <b>Всего голосов:</b> {total_votes}")
@@ -122,7 +141,11 @@ def format_text_poll_summary(
     return "\n".join(lines)
 
 
-def generate_text_answers_csv(question: str, answers: List[TextAnswer]) -> bytes:
+def generate_text_answers_csv(
+    question: str,
+    answers: List[TextAnswer],
+    is_anonymous: bool = False,
+) -> bytes:
     """Generates Excel CSV (UTF-8 with BOM) for text answers."""
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";", quoting=csv.QUOTE_MINIMAL)
@@ -130,6 +153,7 @@ def generate_text_answers_csv(question: str, answers: List[TextAnswer]) -> bytes
     writer.writerow(["Опрос с открытыми ответами"])
     writer.writerow(["Вопрос:", question])
     writer.writerow(["Всего ответов:", len(answers)])
+    writer.writerow(["Тип:", "Анонимный" if is_anonymous else "Открытый"])
     writer.writerow([])
 
     writer.writerow([
@@ -143,11 +167,18 @@ def generate_text_answers_csv(question: str, answers: List[TextAnswer]) -> bytes
 
     for idx, ans in enumerate(answers, start=1):
         dt_str = ans.submitted_at.strftime("%Y-%m-%d %H:%M:%S") if ans.submitted_at else ""
-        username_str = f"@{ans.username}" if ans.username else "—"
-        fullname_str = ans.user_fullname or "—"
+        if is_anonymous:
+            u_id = "—"
+            fullname_str = f"Участник #{idx}"
+            username_str = "—"
+        else:
+            u_id = ans.user_id
+            fullname_str = ans.user_fullname or "—"
+            username_str = f"@{ans.username}" if ans.username else "—"
+
         writer.writerow([
             idx,
-            ans.user_id,
+            u_id,
             fullname_str,
             username_str,
             dt_str,
@@ -157,7 +188,11 @@ def generate_text_answers_csv(question: str, answers: List[TextAnswer]) -> bytes
     return output.getvalue().encode("utf-8-sig")
 
 
-def generate_text_answers_txt(question: str, answers: List[TextAnswer]) -> bytes:
+def generate_text_answers_txt(
+    question: str,
+    answers: List[TextAnswer],
+    is_anonymous: bool = False,
+) -> bytes:
     """Generates clean readable TXT document with all text answers."""
     lines = [
         "==================================================",
@@ -165,6 +200,7 @@ def generate_text_answers_txt(question: str, answers: List[TextAnswer]) -> bytes
         "==================================================",
         f"Вопрос: {question}",
         f"Всего ответов: {len(answers)}",
+        f"Тип: {'Анонимный' if is_anonymous else 'Открытый'}",
         "==================================================\n",
     ]
 
@@ -173,10 +209,13 @@ def generate_text_answers_txt(question: str, answers: List[TextAnswer]) -> bytes
     else:
         for idx, ans in enumerate(answers, start=1):
             dt_str = ans.submitted_at.strftime("%d.%m.%Y %H:%M:%S UTC") if ans.submitted_at else ""
-            user_info = ans.user_fullname or ""
-            if ans.username:
-                user_info += f" (@{ans.username})"
-            user_info += f" [ID: {ans.user_id}]"
+            if is_anonymous:
+                user_info = f"Участник #{idx}"
+            else:
+                user_info = ans.user_fullname or ""
+                if ans.username:
+                    user_info += f" (@{ans.username})"
+                user_info += f" [ID: {ans.user_id}]"
 
             lines.append(f"Ответ #{idx} от {user_info} ({dt_str}):")
             lines.append("-" * 40)
@@ -189,7 +228,8 @@ def generate_text_answers_txt(question: str, answers: List[TextAnswer]) -> bytes
 def generate_choice_votes_csv(
     question: str,
     votes: List[Vote],
-    options_map: dict[int, str]
+    options_map: dict[int, str],
+    is_anonymous: bool = False,
 ) -> bytes:
     """Generates CSV audit of choice votes."""
     output = io.StringIO()
@@ -198,6 +238,7 @@ def generate_choice_votes_csv(
     writer.writerow(["Отчет по голосованию (Опрос с вариантами)"])
     writer.writerow(["Вопрос:", question])
     writer.writerow(["Всего проголосовало:", len(votes)])
+    writer.writerow(["Тип голосования:", "Анонимное" if is_anonymous else "Открытое"])
     writer.writerow([])
 
     writer.writerow([
@@ -212,11 +253,20 @@ def generate_choice_votes_csv(
     for idx, v in enumerate(votes, start=1):
         dt_str = v.voted_at.strftime("%Y-%m-%d %H:%M:%S") if v.voted_at else ""
         opt_text = options_map.get(v.option_id, "Неизвестный вариант")
+        if is_anonymous:
+            u_id = "—"
+            u_name = f"Участник #{idx}"
+            u_user = "—"
+        else:
+            u_id = v.user_id
+            u_name = v.user_fullname or "—"
+            u_user = f"@{v.username}" if v.username else "—"
+
         writer.writerow([
             idx,
-            v.user_id,
-            v.user_fullname or "—",
-            f"@{v.username}" if v.username else "—",
+            u_id,
+            u_name,
+            u_user,
             opt_text,
             dt_str
         ])

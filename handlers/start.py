@@ -120,13 +120,15 @@ async def cmd_start_deep_link(
 
 
 @router.message(CommandStart())
+@router.callback_query(F.data == "btn_main_menu")
 async def cmd_start_default(
-    message: Message,
+    event: Message | CallbackQuery,
     session_factory: async_sessionmaker[AsyncSession],
     state: FSMContext,
 ) -> None:
-    """Standard /start greeting."""
-    if not message.from_user:
+    """Standard /start greeting and main menu."""
+    user = event.from_user
+    if not user:
         return
 
     await state.clear()
@@ -134,24 +136,25 @@ async def cmd_start_default(
     async with session_factory() as session:
         await upsert_user(
             session=session,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name,
+            user_id=user.id,
+            username=user.username,
+            full_name=user.full_name,
         )
 
-    first_name = html.escape(message.from_user.first_name or "друг")
+    first_name = html.escape(user.first_name or "друг")
     greeting = (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
         f"Я — бот для проведения интерактивных опросов со <b>скрытыми результатами</b>, "
         f"поддержкой <b>форумных тем (Topics / Ветки)</b> и <b>открытых развёрнутых ответов</b>.\n\n"
         f"✨ <b>Возможности:</b>\n"
-        f"• 📊 <b>Опросы с вариантами</b> — скрытые результаты во время голосования, "
-        f"участник может сменить голос, в конце публикуется диаграмма (прогресс-бар)!\n"
+        f"• 📊 <b>Опросы с вариантами</b> — один или несколько ответов, скрытые или открытые результаты, "
+        f"автоматическая диаграмма (прогресс-бар) на финише!\n"
         f"• 💬 <b>Поддержка тем форума</b> — бот публикует и завершает опрос в нужной ветке "
         f"супергруппы по её <code>message_thread_id</code>.\n"
         f"• ✍️ <b>Опросы со свободным текстом</b> — сбор мнений в ЛС бота с экспортом в Excel (CSV) / TXT.\n"
-        f"• ⏱ <b>Таймер дедлайна</b> — автоматическое завершение опроса через APScheduler.\n"
-        f"• 🔒 <b>Защита</b> — 1 человек = 1 голос, управление только у создателя или админа чата.\n\n"
+        f"• ⏱ <b>Таймер и точная дата</b> — завершение по относительному времени или точной дате (например: <code>15.11 18:00</code>).\n"
+        f"• 📁 <b>Шаблоны</b> — сохранение опросов и запуск в 1 клик.\n"
+        f"• 🔒 <b>Защита и гибкость</b> — анонимные/открытые опросы, фильтрация по @username или только для админов.\n\n"
         f"Выберите действие ниже:"
     )
 
@@ -167,7 +170,11 @@ async def cmd_start_default(
                 InlineKeyboardButton(
                     text="📋 Мои опросы",
                     callback_data="btn_my_polls",
-                )
+                ),
+                InlineKeyboardButton(
+                    text="📁 Шаблоны",
+                    callback_data="btn_templates",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -178,7 +185,11 @@ async def cmd_start_default(
         ]
     )
 
-    await message.answer(greeting, reply_markup=kb, parse_mode="HTML")
+    if isinstance(event, Message):
+        await event.answer(greeting, reply_markup=kb, parse_mode="HTML")
+    elif isinstance(event, CallbackQuery) and event.message:
+        await event.message.edit_text(greeting, reply_markup=kb, parse_mode="HTML")
+        await event.answer()
 
 
 @router.message(Command("help"))
@@ -255,14 +266,22 @@ async def cmd_my_polls(
             ]
         )
 
-    buttons.append(
-        [
+    has_closed = any(p.is_closed for p in polls)
+
+    action_row = [
+        InlineKeyboardButton(
+            text="➕ Новый опрос",
+            callback_data="btn_create_poll",
+        )
+    ]
+    if has_closed:
+        action_row.append(
             InlineKeyboardButton(
-                text="➕ Создать ещё опрос",
-                callback_data="btn_create_poll",
+                text="🗑 Удалить завершённые",
+                callback_data="del_all_closed_ask",
             )
-        ]
-    )
+        )
+    buttons.append(action_row)
 
     text = "\n".join(lines) + "\n\n<i>Нажмите на опрос ниже для управления:</i>"
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)

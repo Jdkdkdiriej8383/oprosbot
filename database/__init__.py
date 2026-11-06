@@ -4,6 +4,10 @@ from database.db_manager import (
     close_db,
     close_poll,
     create_poll,
+    create_poll_template,
+    delete_closed_polls_for_user,
+    delete_poll,
+    delete_template,
     get_active_polls_with_deadlines,
     get_all_text_answers,
     get_choice_poll_stats,
@@ -11,16 +15,22 @@ from database.db_manager import (
     get_poll,
     get_poll_posts,
     get_session_factory,
+    get_template,
+    get_user_group_chats,
     get_user_polls,
+    get_user_templates,
     get_user_text_answer,
     get_user_vote,
     init_db,
     record_choice_vote,
     save_text_answer,
     track_poll_post,
+    update_poll_deadline,
+    update_poll_question,
+    update_poll_result_destination,
     upsert_user,
 )
-from database.models import Base, Option, Poll, PollOption, PollPost, TextAnswer, TextResponse, User, Vote
+from database.models import Base, Option, Poll, PollOption, PollPost, PollTemplate, TextAnswer, TextResponse, User, Vote
 
 __all__ = [
     "Base",
